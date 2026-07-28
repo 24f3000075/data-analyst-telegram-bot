@@ -1,4 +1,6 @@
 import json
+import re
+import time
 
 from google import genai
 from google.genai import types
@@ -8,6 +10,7 @@ from app.logger import RunLogger
 from app.tools import TOOL_SPECS, execute_tool
 
 _client = genai.Client(api_key=GEMINI_API_KEY)
+_MAX_RETRIES_PER_STEP = 5
 
 _FUNCTION_DECLARATIONS = [
     types.FunctionDeclaration(
@@ -36,10 +39,18 @@ paste the data inline, use web_search to find the actual dataset/report page, th
 fetch_url to download the actual file (CSV/XLSX/PDF/HTML), then run_python (pandas is \
 available) to compute the precise answer from real numbers. Do not guess or rely on \
 general knowledge for anything a dataset could answer more precisely.
+- web_search can be unreliable. If it errors or returns nothing useful, do NOT retry it \
+more than once -- immediately fall back to run_python with the `requests` library to \
+fetch a known reference (Wikipedia, data.gov.in, mospi.gov.in, press releases, PIB) \
+directly, or fetch_url a specific URL you already know or can construct. This fallback \
+path is reliable; use it rather than looping on web_search.
 - If the data is given inline in the message, use run_python to parse and compute over \
 it directly rather than eyeballing it.
 - Show your work through tool calls; don't skip straight to a guess.
 - Numeric answers should be computed, not estimated, whenever the source data is available.
+- Be efficient: each tool call costs time and a limited API quota. Don't repeat a nearly \
+identical call twice in a row -- if an approach fails once, switch strategy rather than \
+retrying the same thing.
 
 When you are done and have a final, confident answer, respond with ONLY the JSON value \
 that belongs in the "answer" field -- valid JSON, nothing else: no markdown fences, no \
@@ -48,6 +59,17 @@ explanation, no surrounding prose, no the word "answer". For example if asked fo
 final message must be exactly:
 {"state": "Assam"}
 """
+
+
+def _extract_retry_delay(error_message: str) -> float:
+    match = re.search(r"retry(?:Delay)?['\"]?\s*[:=]?\s*['\"]?(\d+(?:\.\d+)?)s?", error_message, re.IGNORECASE)
+    if match:
+        return float(match.group(1)) + 2
+    return 20.0
+
+
+def _is_rate_limit_error(error_message: str) -> bool:
+    return "429" in error_message or "RESOURCE_EXHAUSTED" in error_message
 
 
 def _history_to_contents(messages: list) -> list:
@@ -84,13 +106,28 @@ def run_agent(messages: list, run_logger: RunLogger) -> dict:
 
     final_text = None
     for step in range(MAX_AGENT_STEPS):
-        try:
-            response = _client.models.generate_content(
-                model=GEMINI_MODEL, contents=contents, config=config
-            )
-        except Exception as e:
-            run_logger.log("api_error", step=step, error=str(e))
-            return {"answer": None, "raw_final_text": "", "error": f"API error: {e}"}
+        response = None
+        for attempt in range(_MAX_RETRIES_PER_STEP):
+            try:
+                response = _client.models.generate_content(
+                    model=GEMINI_MODEL, contents=contents, config=config
+                )
+                break
+            except Exception as e:
+                err_str = str(e)
+                if _is_rate_limit_error(err_str) and attempt < _MAX_RETRIES_PER_STEP - 1:
+                    delay = _extract_retry_delay(err_str)
+                    run_logger.log(
+                        "rate_limited_retry",
+                        step=step,
+                        attempt=attempt,
+                        delay_seconds=delay,
+                        error=err_str,
+                    )
+                    time.sleep(delay)
+                    continue
+                run_logger.log("api_error", step=step, error=err_str)
+                return {"answer": None, "raw_final_text": "", "error": f"API error: {e}"}
 
         candidate = response.candidates[0] if response.candidates else None
         parts = candidate.content.parts if candidate and candidate.content else []

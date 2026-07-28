@@ -17,7 +17,7 @@ def web_search(query: str) -> dict:
         "https://html.duckduckgo.com/html/",
         data={"q": query},
         headers={"User-Agent": "Mozilla/5.0 (data-analyst-agent/1.0)"},
-        timeout=FETCH_TIMEOUT,
+        timeout=8,
     )
     resp.raise_for_status()
     soup = BeautifulSoup(resp.text, "html.parser")
