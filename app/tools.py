@@ -6,58 +6,84 @@ import textwrap
 from urllib.parse import urlparse
 
 import requests
+from bs4 import BeautifulSoup
 
 from app.config import DOWNLOADS_DIR, FETCH_TIMEOUT, PYTHON_EXEC_TIMEOUT
 
-# ---------------------------------------------------------------------------
-# Tool schemas passed to the Anthropic API. `web_search` is a server-side tool
-# (Anthropic runs it and injects results automatically); the other two are
-# client-side tools we execute ourselves in execute_tool() below.
-# ---------------------------------------------------------------------------
 
-WEB_SEARCH_TOOL = {"type": "web_search_20250305", "name": "web_search"}
+def web_search(query: str) -> dict:
+    """Free, no-API-key web search via DuckDuckGo's HTML endpoint."""
+    resp = requests.post(
+        "https://html.duckduckgo.com/html/",
+        data={"q": query},
+        headers={"User-Agent": "Mozilla/5.0 (data-analyst-agent/1.0)"},
+        timeout=FETCH_TIMEOUT,
+    )
+    resp.raise_for_status()
+    soup = BeautifulSoup(resp.text, "html.parser")
 
-FETCH_URL_TOOL = {
-    "name": "fetch_url",
-    "description": (
-        "Download a public URL (CSV, XLSX, JSON, HTML, PDF, or any file) to local "
-        "disk so it can be analyzed with run_python. Returns the local file path, "
-        "detected content type, size, and a short text preview. Use this before "
-        "run_python whenever the question points at an external dataset (MOSPI, "
-        "data.gov.in, etc.) instead of trying to guess the data's contents."
-    ),
-    "input_schema": {
-        "type": "object",
-        "properties": {
-            "url": {"type": "string", "description": "The URL to download."},
+    results = []
+    for result in soup.select(".result")[:8]:
+        link_tag = result.select_one(".result__a")
+        snippet_tag = result.select_one(".result__snippet")
+        if not link_tag:
+            continue
+        results.append(
+            {
+                "title": link_tag.get_text(strip=True),
+                "url": link_tag.get("href", ""),
+                "snippet": snippet_tag.get_text(strip=True) if snippet_tag else "",
+            }
+        )
+    return {"query": query, "results": results}
+
+
+TOOL_SPECS = [
+    {
+        "name": "web_search",
+        "description": (
+            "Search the web and return a list of {title, url, snippet} results. "
+            "Use this to find the actual page/report/dataset for a question "
+            "referencing MOSPI, data.gov.in, or other public statistics -- then "
+            "fetch_url the real URL you find here."
+        ),
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {"query": {"type": "STRING", "description": "Search query."}},
+            "required": ["query"],
         },
-        "required": ["url"],
     },
-}
-
-RUN_PYTHON_TOOL = {
-    "name": "run_python",
-    "description": (
-        "Execute a Python snippet in a sandboxed subprocess and return its stdout "
-        "(plus stderr on failure). Pandas, numpy, openpyxl, requests, pdfplumber, "
-        "and bs4 are pre-installed. Use this to load files fetch_url downloaded "
-        "(paths are given to you in fetch_url's result) and compute the actual "
-        "answer -- print() whatever you need to see, including the final "
-        "computed value. Each call is a fresh process: no state carries over "
-        "between run_python calls, so print intermediate results you need later "
-        "and recompute or re-load data as needed."
-    ),
-    "input_schema": {
-        "type": "object",
-        "properties": {
-            "code": {"type": "string", "description": "The Python code to run."},
+    {
+        "name": "fetch_url",
+        "description": (
+            "Download a public URL (CSV, XLSX, JSON, HTML, PDF, or any file) to local "
+            "disk so it can be analyzed with run_python. Returns the local file path, "
+            "detected content type, size, and a short text preview."
+        ),
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {"url": {"type": "STRING", "description": "The URL to download."}},
+            "required": ["url"],
         },
-        "required": ["code"],
     },
-}
-
-CLIENT_TOOLS = [FETCH_URL_TOOL, RUN_PYTHON_TOOL]
-ALL_TOOLS = [WEB_SEARCH_TOOL] + CLIENT_TOOLS
+    {
+        "name": "run_python",
+        "description": (
+            "Execute a Python snippet in a sandboxed subprocess and return its stdout "
+            "(plus stderr on failure). Pandas, numpy, openpyxl, requests, pdfplumber, "
+            "and bs4 are pre-installed. Use this to load files fetch_url downloaded "
+            "and compute the actual answer -- print() whatever you need to see, "
+            "including the final computed value. Each call is a fresh process: no "
+            "state carries over between run_python calls, so print intermediate "
+            "results you need later and recompute or re-load data as needed."
+        ),
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {"code": {"type": "STRING", "description": "The Python code to run."}},
+            "required": ["code"],
+        },
+    },
+]
 
 
 def _guess_extension(url: str, content_type: str) -> str:
@@ -102,10 +128,9 @@ def _preview_bytes(path: str, ext: str, content_type: str) -> str:
         if ext in ("json",):
             with open(path, "r", errors="replace") as f:
                 return f.read(1500)
-        # html / txt / anything else -> raw text preview
         with open(path, "r", errors="replace") as f:
             return f.read(1500)
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:
         return f"(could not generate preview: {e})"
 
 
@@ -128,7 +153,7 @@ def fetch_url(url: str) -> dict:
         for chunk in resp.iter_content(chunk_size=1 << 16):
             f.write(chunk)
             total += len(chunk)
-            if total > 50 * 1024 * 1024:  # 50MB safety cap
+            if total > 50 * 1024 * 1024:
                 break
 
     preview = _preview_bytes(local_path, ext, content_type)
@@ -168,6 +193,8 @@ def run_python(code: str) -> dict:
 
 
 def execute_tool(name: str, tool_input: dict) -> dict:
+    if name == "web_search":
+        return web_search(tool_input["query"])
     if name == "fetch_url":
         return fetch_url(tool_input["url"])
     if name == "run_python":

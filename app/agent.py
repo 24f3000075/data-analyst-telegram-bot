@@ -1,14 +1,24 @@
 import json
 
-import anthropic
+from google import genai
+from google.genai import types
 
-from app.config import ANTHROPIC_API_KEY, ANTHROPIC_MODEL, MAX_AGENT_STEPS
+from app.config import GEMINI_API_KEY, GEMINI_MODEL, MAX_AGENT_STEPS
 from app.logger import RunLogger
-from app.tools import ALL_TOOLS, CLIENT_TOOLS, execute_tool
+from app.tools import TOOL_SPECS, execute_tool
 
-_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+_client = genai.Client(api_key=GEMINI_API_KEY)
 
-_CLIENT_TOOL_NAMES = {t["name"] for t in CLIENT_TOOLS}
+_FUNCTION_DECLARATIONS = [
+    types.FunctionDeclaration(
+        name=spec["name"],
+        description=spec["description"],
+        parameters=types.Schema(**spec["parameters"]),
+    )
+    for spec in TOOL_SPECS
+]
+_GEMINI_TOOLS = [types.Tool(function_declarations=_FUNCTION_DECLARATIONS)]
+_TOOL_NAMES = {spec["name"] for spec in TOOL_SPECS}
 
 SYSTEM_PROMPT = """You are a meticulous data-analyst agent. You receive a data-analysis \
 question (often referencing MOSPI or another public Indian/global statistics dataset, \
@@ -40,107 +50,94 @@ final message must be exactly:
 """
 
 
-def _content_to_text(content) -> str:
-    parts = []
-    for block in content:
-        if getattr(block, "type", None) == "text":
-            parts.append(block.text)
-    return "\n".join(parts)
+def _history_to_contents(messages: list) -> list:
+    contents = []
+    for m in messages:
+        role = "model" if m["role"] == "assistant" else "user"
+        contents.append(types.Content(role=role, parts=[types.Part.from_text(text=m["content"])]))
+    return contents
 
 
-def _block_to_loggable(block) -> dict:
-    btype = getattr(block, "type", "unknown")
-    d = {"type": btype}
-    if btype == "text":
-        d["text"] = block.text
-    elif btype == "tool_use":
-        d["name"] = block.name
-        d["input"] = block.input
-        d["id"] = block.id
-    elif btype == "server_tool_use":
-        d["name"] = getattr(block, "name", None)
-        d["input"] = getattr(block, "input", None)
-    elif btype == "web_search_tool_result":
-        d["content"] = str(getattr(block, "content", ""))[:500]
-    return d
+def _part_to_loggable(part) -> dict:
+    if part.text is not None:
+        return {"type": "text", "text": part.text}
+    if part.function_call is not None:
+        return {
+            "type": "function_call",
+            "name": part.function_call.name,
+            "args": dict(part.function_call.args or {}),
+        }
+    return {"type": "unknown"}
 
 
 def run_agent(messages: list, run_logger: RunLogger) -> dict:
-    """
-    messages: list of {"role": "user"|"assistant", "content": str} -- full chat
-              history for this Telegram chat, last item is the question to answer.
-    Returns: {"answer": <parsed json value>, "raw_final_text": str, "error": str|None}
-    """
     run_logger.log("agent_start", history=messages)
 
-    api_messages = [{"role": m["role"], "content": m["content"]} for m in messages]
+    contents = _history_to_contents(messages)
+    config = types.GenerateContentConfig(
+        system_instruction=SYSTEM_PROMPT,
+        tools=_GEMINI_TOOLS,
+        tool_config=types.ToolConfig(
+            function_calling_config=types.FunctionCallingConfig(mode="AUTO")
+        ),
+    )
 
     final_text = None
     for step in range(MAX_AGENT_STEPS):
         try:
-            response = _client.messages.create(
-                model=ANTHROPIC_MODEL,
-                max_tokens=4096,
-                system=SYSTEM_PROMPT,
-                messages=api_messages,
-                tools=ALL_TOOLS,
+            response = _client.models.generate_content(
+                model=GEMINI_MODEL, contents=contents, config=config
             )
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             run_logger.log("api_error", step=step, error=str(e))
             return {"answer": None, "raw_final_text": "", "error": f"API error: {e}"}
+
+        candidate = response.candidates[0] if response.candidates else None
+        parts = candidate.content.parts if candidate and candidate.content else []
 
         run_logger.log(
             "model_response",
             step=step,
-            stop_reason=response.stop_reason,
-            content=[_block_to_loggable(b) for b in response.content],
+            content=[_part_to_loggable(p) for p in parts],
         )
 
-        if response.stop_reason != "tool_use":
-            final_text = _content_to_text(response.content).strip()
+        function_calls = [p for p in parts if p.function_call is not None]
+
+        if not function_calls:
+            final_text = "".join(p.text for p in parts if p.text is not None).strip()
             break
 
-        # Append the assistant turn (raw, so tool_use ids line up) and execute
-        # any client-side tool calls, then continue the loop.
-        api_messages.append({"role": "assistant", "content": response.content})
+        contents.append(types.Content(role="model", parts=parts))
 
-        tool_results = []
-        for block in response.content:
-            if getattr(block, "type", None) == "tool_use" and block.name in _CLIENT_TOOL_NAMES:
+        response_parts = []
+        for part in function_calls:
+            name = part.function_call.name
+            args = dict(part.function_call.args or {})
+            if name not in _TOOL_NAMES:
+                result = {"error": f"Unknown tool: {name}"}
+                is_error = True
+            else:
                 try:
-                    result = execute_tool(block.name, block.input)
-                    result_str = json.dumps(result, default=str)
+                    result = execute_tool(name, args)
                     is_error = False
-                except Exception as e:  # noqa: BLE001
-                    result_str = f"Tool error: {e}"
+                except Exception as e:
+                    result = {"error": str(e)}
                     is_error = True
 
-                run_logger.log(
-                    "tool_call",
-                    step=step,
-                    tool=block.name,
-                    input=block.input,
-                    result=result_str[:3000],
-                    is_error=is_error,
-                )
-
-                tool_results.append(
-                    {
-                        "type": "tool_result",
-                        "tool_use_id": block.id,
-                        "content": result_str[:6000],
-                        "is_error": is_error,
-                    }
-                )
-
-        if tool_results:
-            api_messages.append({"role": "user", "content": tool_results})
-        else:
-            # stop_reason was tool_use but nothing for us to execute (e.g. only
-            # server-side web_search happened) -- ask the model to continue.
-            api_messages.append(
-                {"role": "user", "content": "Continue."}
+            run_logger.log(
+                "tool_call",
+                step=step,
+                tool=name,
+                input=args,
+                result=json.dumps(result, default=str)[:3000],
+                is_error=is_error,
             )
+
+            response_parts.append(
+                types.Part.from_function_response(name=name, response=result)
+            )
+
+        contents.append(types.Content(role="user", parts=response_parts))
 
     if final_text is None:
         run_logger.log("agent_max_steps_reached")
@@ -161,7 +158,6 @@ def run_agent(messages: list, run_logger: RunLogger) -> dict:
         parsed_answer = json.loads(cleaned)
     except json.JSONDecodeError as e:
         parse_error = str(e)
-        # Fall back to treating the raw text as the answer string.
         parsed_answer = final_text
 
     run_logger.log(
