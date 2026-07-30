@@ -54,10 +54,13 @@ retrying the same thing.
 
 When you are done and have a final, confident answer, respond with ONLY the JSON value \
 that belongs in the "answer" field -- valid JSON, nothing else: no markdown fences, no \
-explanation, no surrounding prose, no the word "answer". For example if asked for \
-{"answer": {"state": "..."}, ...} and you've determined the state is Assam, your entire \
-final message must be exactly:
+explanation, no surrounding prose, no the word "answer", and CRITICALLY no "log_url" key \
+of any kind -- you have no log_url and must never invent or include one. For example if \
+asked for {"answer": {"state": "..."}, ...} and you've determined the state is Assam, \
+your entire final message must be exactly:
 {"state": "Assam"}
+Do NOT write {"answer": {"state": "Assam"}, "log_url": "..."} -- that is wrong, it \
+duplicates the wrapper the calling code already adds and will break the response.
 """
 
 
@@ -196,6 +199,14 @@ def run_agent(messages: list, run_logger: RunLogger) -> dict:
     except json.JSONDecodeError as e:
         parse_error = str(e)
         parsed_answer = final_text
+
+    if (
+        isinstance(parsed_answer, dict)
+        and "answer" in parsed_answer
+        and "log_url" in parsed_answer
+        and len(parsed_answer) == 2
+    ):
+        parsed_answer = parsed_answer["answer"]
 
     run_logger.log(
         "agent_final_answer",
