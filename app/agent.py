@@ -59,6 +59,11 @@ statistics usually have a clean wikitable with exactly the numbers you need), or
 data.gov.in / mospi.gov.in directly. One well-chosen structured fetch beats five vague \
 searches. Budget your steps: aim to have real data in hand within the first 4-6 tool \
 calls, not the last few.
+- Don't be a perfectionist about sourcing once you have a good answer. If 2+ independent, \
+credible sources (news outlets, government press summaries, etc.) already agree on a \
+figure, that is sufficient -- stop and answer. Do not keep hunting for the exact primary \
+PDF/press-release URL once corroborated data is already in hand; that wastes your step \
+budget on verification that doesn't change the answer.
 
 When you are done and have a final, confident answer, respond with ONLY the JSON value \
 that belongs in the "answer" field -- valid JSON, nothing else: no markdown fences, no \
