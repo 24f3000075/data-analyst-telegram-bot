@@ -17,6 +17,6 @@ DOWNLOADS_DIR = os.path.join(BASE_DIR, "downloads")
 os.makedirs(LOGS_DIR, exist_ok=True)
 os.makedirs(DOWNLOADS_DIR, exist_ok=True)
 
-MAX_AGENT_STEPS = 12
+MAX_AGENT_STEPS = 18
 PYTHON_EXEC_TIMEOUT = 45
 FETCH_TIMEOUT = 30

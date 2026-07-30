@@ -51,6 +51,14 @@ it directly rather than eyeballing it.
 - Be efficient: each tool call costs time and a limited API quota. Don't repeat a nearly \
 identical call twice in a row -- if an approach fails once, switch strategy rather than \
 retrying the same thing.
+- Prefer STRUCTURED sources over many narrow web_search queries. If web_search returns \
+empty or unhelpful results a couple of times, stop refining the search phrase and instead \
+go straight for a known structured reference: fetch a relevant Wikipedia article with \
+run_python + requests + pandas.read_html(...) (Wikipedia articles on Indian states/health \
+statistics usually have a clean wikitable with exactly the numbers you need), or try \
+data.gov.in / mospi.gov.in directly. One well-chosen structured fetch beats five vague \
+searches. Budget your steps: aim to have real data in hand within the first 4-6 tool \
+calls, not the last few.
 
 When you are done and have a final, confident answer, respond with ONLY the JSON value \
 that belongs in the "answer" field -- valid JSON, nothing else: no markdown fences, no \
@@ -200,12 +208,7 @@ def run_agent(messages: list, run_logger: RunLogger) -> dict:
         parse_error = str(e)
         parsed_answer = final_text
 
-    if (
-        isinstance(parsed_answer, dict)
-        and "answer" in parsed_answer
-        and "log_url" in parsed_answer
-        and len(parsed_answer) == 2
-    ):
+    if isinstance(parsed_answer, dict) and "answer" in parsed_answer:
         parsed_answer = parsed_answer["answer"]
 
     run_logger.log(
